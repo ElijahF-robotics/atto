@@ -10,6 +10,7 @@ use crossterm::{
     execute, queue
 };
 use crossterm::event::KeyModifiers;
+use crossterm::style::{Color, SetBackgroundColor, ResetColor};
 
 
 fn main() -> io::Result<()> {
@@ -29,6 +30,10 @@ fn main() -> io::Result<()> {
 
     // In save mode or not?
     let mut save_mode = false;
+
+    // Save cursor positions while in save mode
+    let mut save_cursor_x = 0;
+    let mut save_cursor_y = 0;
 
     // Scrolling variables
     let mut scroll_x = 0;
@@ -52,10 +57,11 @@ fn main() -> io::Result<()> {
 
     loop {
         // Draw current state
-        draw(&mut stdout, &buffer, &save_buffer, cursor_x, cursor_y, scroll_x, scroll_y)?;
+        draw(&mut stdout, &buffer, &save_buffer, cursor_x, cursor_y, scroll_x, scroll_y, save_mode)?;
 
         // Get current width and height of terminal
         let (width, height) = terminal::size()?;
+        let visible_lines = (height - 2) as usize;
 
         // Read key event
         if let Event::Key(key_event) = event::read()? {
@@ -81,13 +87,21 @@ fn main() -> io::Result<()> {
 
                             // Ctrl-s
                             if c == 's' {
+                                if !save_mode {
+                                    save_cursor_x = cursor_x;
+                                    save_cursor_y = cursor_y;
 
-                                cursor_x = 0;
-                                cursor_y = (height-1) as usize;
-                                save_mode = true;
+                                    cursor_x = 0;
+                                    cursor_y = (height-1) as usize;
+                                    save_mode = true;
+                                }
+
                             }
                         } else {
                             insert(&mut buffer, cursor_x, cursor_y, c); cursor_x += 1;
+                            if cursor_x > width as usize {
+                                scroll_x += 1;
+                            }
                         }
                     }
                 }
@@ -113,6 +127,10 @@ fn main() -> io::Result<()> {
                             buffer.insert(cursor_y+1, String::new());
                             cursor_y += 1;
                             cursor_x = 0;
+
+                            if cursor_y >= scroll_y + visible_lines {
+                                scroll_y = cursor_y - visible_lines + 1;
+                            }
                         } else {
                             // Get the part after the cursor
                             let remainder = buffer[cursor_y][cursor_x..].to_string();
@@ -150,46 +168,77 @@ fn main() -> io::Result<()> {
                                 cursor_x = buffer[cursor_y].len();
                                 buffer[cursor_y].push_str(&current_line); // Append current to previous
                                 queue!(
-                            stdout,
-                            cursor::MoveTo(0, buffer.len() as u16),
-                            terminal::Clear(terminal::ClearType::CurrentLine)
-                        )?;
+                                    stdout,
+                                    cursor::MoveTo(0, buffer.len() as u16),
+                                    terminal::Clear(terminal::ClearType::CurrentLine)
+                                )?;
+
+                                if cursor_y < scroll_y {
+                                    scroll_y = cursor_y;
+                                }
                             }
                         }
                     }
                 }
 
                 KeyCode::Up => {
-                    if cursor_y > 0 {
+                    if key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                        cursor_y = 0;
+                        if buffer[cursor_y].len() < cursor_x {
+                            cursor_x = buffer[cursor_y].len();
+                        }
+                    } else if cursor_y > 0 {
                         cursor_y -= 1;
                         if cursor_x > buffer[cursor_y].len(){
                             cursor_x = buffer[cursor_y].len();
                         }
                     }
+
+                    if cursor_y < scroll_y {
+                        scroll_y = cursor_y;
+                    }
                 }
 
                 KeyCode::Down => {
-                    if cursor_y < buffer.len() - 1{
+                    if key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                        // Ctrl-Down
+                        cursor_y = buffer.len() - 1;
+                        if buffer[cursor_y].len() < cursor_x {
+                            cursor_x = buffer[cursor_y].len();
+                        }
+
+                    } else if cursor_y < buffer.len() - 1{
                         cursor_y += 1;
                         if cursor_x > buffer[cursor_y].len(){
                             cursor_x = buffer[cursor_y].len();
                         }
+                    }
+
+                    if cursor_y >= scroll_y + visible_lines {
+                        scroll_y = cursor_y - visible_lines + 1;
                     }
                 }
 
                 KeyCode::Left => {
                     if key_event.modifiers.contains(KeyModifiers::CONTROL) {
                         cursor_x = 0;
-                    }
-                    if cursor_x > 0 {
+                        scroll_x = 0;
+                    } else if cursor_x > 0 {
                         cursor_x -= 1;
+                    }
+
+                    // Check if we need to scroll left
+                    if cursor_x < scroll_x {
+                        scroll_x = cursor_x;
                     }
                 }
 
                 KeyCode::Right => {
                     if key_event.modifiers.contains(KeyModifiers::CONTROL) {
                         cursor_x = buffer[cursor_y].len();
-                    } else if cursor_x < buffer[cursor_y].len() {
+                    } else if !save_mode && cursor_x < buffer[cursor_y].len() {
+                        cursor_x += 1;
+                    } else if cursor_x < save_buffer.len() {
                         cursor_x += 1;
                     }
 
@@ -200,39 +249,68 @@ fn main() -> io::Result<()> {
                     }
                 }
 
+                KeyCode::Esc => {
+                    if save_mode {
+                        save_mode = false;
+                        cursor_x = save_cursor_x;
+                        cursor_y = save_cursor_y;
+                    }
+                }
+
                 _ => {}
             }
         }
     }
 }
 
-fn draw(stdout: &mut io::Stdout, buffer: &[String], save_buffer: &String, cursor_x: usize, cursor_y: usize, scroll_x: usize, scroll_y: usize) -> io::Result<()> {
+fn draw(stdout: &mut io::Stdout, buffer: &[String], save_buffer: &String, cursor_x: usize, cursor_y: usize, scroll_x: usize, scroll_y: usize, save_mode: bool) -> io::Result<()> {
     let (width, height) = terminal::size()?;
+    let visible_lines = (height - 2) as usize;
 
     // Move cursor to top-left
     queue!(stdout, cursor::MoveTo(0, 0))?;
 
     // Draw each line of the buffer
-    for (i, line) in buffer.iter().enumerate() {
+    for (i, line) in buffer.iter().skip(scroll_y).take(visible_lines).enumerate() {
+        queue!(stdout, cursor::MoveTo(0, i as u16))?;
+
         if i >= (height - 1) as usize {break;}
+
         queue!(stdout,
             cursor::MoveTo(0, i as u16),
             terminal::Clear(terminal::ClearType::CurrentLine)
         )?;
-        let visible_string = line[scroll_x..].to_string();
+
+        // Get the horizontal component of string
+        let visible_string = if scroll_x < line.len() {
+            line[scroll_x..].to_string()
+        } else {
+            String::new()  // Line is shorter than scroll offset
+        };
         write!(stdout, "{}", visible_string)?;
     }
 
     // Draw status line at bottom
     queue!(stdout, cursor::MoveTo(0, height - 2))?;
     write!(stdout, "{}", "*".repeat(width as usize))?; // Line of asterisks
-
-    // Draw message on status line (like filename prompt)
     queue!(stdout, cursor::MoveTo(0, height - 1), terminal::Clear(terminal::ClearType::CurrentLine))?;
+
+    if save_mode {
+        queue!(stdout, SetBackgroundColor(Color::DarkGreen))?;
+    }
+
+    // Draw filename on bottom
     write!(stdout, "{}", save_buffer)?;
 
+    if save_mode {
+        queue!(stdout, ResetColor)?;
+    }
+
     // Position cursor where user expects it
-    queue!(stdout, cursor::MoveTo(cursor_x as u16, cursor_y as u16))?;
+    queue!(stdout, cursor::MoveTo(
+        (cursor_x - scroll_x) as u16,
+        (cursor_y - scroll_y) as u16
+    ))?;
 
     // Actually write everything to screen
     stdout.flush()?;
